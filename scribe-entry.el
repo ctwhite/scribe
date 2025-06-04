@@ -19,6 +19,7 @@
 (require 'project)
 (require 'scribe-context)
 (require 'ts)
+(require 'cacheus-memoize) ; NEW: Required for cacheus-memoize!
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Log Entry Structure ;;
@@ -118,26 +119,28 @@
 
   Returns: The resolved source path as a canonical string, or the original FILE
   if no mapping applies or an error occurs."
-  (unless (stringp file)
-    (message "[scribe-entry] WARNING: Invalid file path for source resolution: %S" file)
-    (cl-return-from scribe-entry--resolve-source-path nil))
+  (cl-block scribe-entry--resolve-source-path
+    (unless (stringp file)
+      (message "[scribe-entry] WARNING: Invalid file path for source resolution: %S" file)
+      (cl-return-from scribe-entry--resolve-source-path nil))
 
-  (let ((canonical-file (f-canonical file)))
-    (condition-case err
-        (dolist (mapping scribe-source-root-mapping canonical-file) ; Default to canonical-file if no match
-          (let ((installed-root (f-canonical (car mapping)))
-                (source-root (f-canonical (cdr mapping))))
-            (when (string-prefix-p installed-root canonical-file)
-              ;; If the file is within an installed root, replace the prefix
-              (message "[scribe-entry] DEBUG: Resolved %S from installed root %S to source root %S."
-                       canonical-file installed-root source-root)
-              (cl-return-from scribe-entry--resolve-source-path
-                (concat source-root (substring canonical-file (length installed-root)))))))
-      (error
-       (message "[scribe-entry] ERROR: Failed to resolve source path for %S: %S" file err)
-       canonical-file)))) ; Fallback to canonical file on error
+    (let ((canonical-file (f-canonical file)))
+      (condition-case err
+          (dolist (mapping scribe-source-root-mapping canonical-file) ; Default to canonical-file if no match
+            (let ((installed-root (f-canonical (car mapping)))
+                  (source-root (f-canonical (cdr mapping))))
+              (when (string-prefix-p installed-root canonical-file)
+                ;; If the file is within an installed root, replace the prefix
+                (message "[scribe-entry] DEBUG: Resolved %S from installed root %S to source root %S."
+                         canonical-file installed-root source-root)
+                (cl-return-from scribe-entry--resolve-source-path
+                  (concat source-root (substring canonical-file (length installed-root)))))))
+        (error
+         (message "[scribe-entry] ERROR: Failed to resolve source path for %S: %S" file err)
+         canonical-file))))) ; Fallback to canonical file on error
 
-(defun scribe-entry--find-project-root (canonical-file)
+;; Replaced cl-defmemo with cacheus-memoize! for advanced caching features
+(cacheus-memoize! scribe-entry--find-project-root (canonical-file)
   "Find the most specific project root for CANONICAL-FILE.
   Prioritizes:
   1. `project-current` for the file's directory.
@@ -147,55 +150,61 @@
 
   Returns: The canonical path of the project root (string), or `nil` if no unique,
   clear match is found or if `project.el` is not loaded."
-  (unless (stringp canonical-file) (cl-return-from scribe-entry--find-project-root nil))
+  ;; Cacheus-memoize! options for scribe-entry--find-project-root
+  :capacity 100 ; Store up to 100 project roots
+  :ttl 3600    ; Cache results for 1 hour (3600 seconds)
+  :eviction-strategy :lru ; Use Least Recently Used eviction
+  :key-fn (lambda (f) (f-canonical f)) ; Ensure the key is the canonical file path
+  (cl-block scribe-entry--find-project-root
+    (unless (stringp canonical-file) (cl-return-from scribe-entry--find-project-root nil))
 
-  ;; Ensure project.el is loaded before attempting any project-related functions
-  (unless (fboundp 'project-current) ; Check for a core project.el function
-    (message "[scribe-entry] DEBUG: project.el not loaded. Cannot use project detection features.")
-    (cl-return-from scribe-entry--find-project-root nil))
+    ;; Ensure project.el is loaded before attempting any project-related functions
+    (unless (fboundp 'project-current) ; Check for a core project.el function
+      (message "[scribe-entry] DEBUG: project.el not loaded. Cannot use project detection features.")
+      (cl-return-from scribe-entry--find-project-root nil))
 
-  ;; 1. Try to get the project directly using `project-current` for the file's directory
-  (let* ((file-dir (f-dirname canonical-file))
-         (current-project (condition-case err
-                              (project-current file-dir)
-                            (error
-                             ;; Log the error but don't prevent fallback
-                             (message "[scribe-entry] ERROR: project-current failed for %S: %S" file-dir err)
-                             nil))))
-    (when current-project
-      (let ((root (project-root current-project)))
-        (message "[scribe-entry] DEBUG: project-current found root for %S: %S."
-                 canonical-file root)
-        ;; Ensure the root is canonical before returning
-        (cl-return-from scribe-entry--find-project-root (f-canonical root)))))
+    ;; 1. Try to get the project directly using `project-current` for the file's directory
+    (let* ((file-dir (f-dirname canonical-file))
+           (current-project (condition-case err
+                                (project-current file-dir)
+                              (error
+                               ;; Log the error but don't prevent fallback
+                               (message "[scribe-entry] ERROR: project-current failed for %S: %S" file-dir err)
+                               nil))))
+      (when current-project
+        (let ((root (project-root current-project)))
+          (message "[scribe-entry] DEBUG: project-current found root for %S: %S."
+                   canonical-file root)
+          ;; Ensure the root is canonical before returning
+          (cl-return-from scribe-entry--find-project-root (f-canonical root)))))
 
-  ;; 2. If `project-current` didn't find a project, perform upward search for project markers
-  (when (and (numberp scribe-entry-fallback-project-detection-depth)
-             (> scribe-entry-fallback-project-detection-depth 0)
-             (fboundp 'project-project-p))
-    (message "[scribe-entry] DEBUG: project-current did not find a project. Attempting fallback upward detection for %S (depth: %d)."
-             canonical-file scribe-entry-fallback-project-detection-depth)
-    (let ((current-dir (f-dirname canonical-file))
-          (depth 0))
-      ;; Loop upwards until root is found or max depth is reached
-      (while (and current-dir (<= depth scribe-entry-fallback-project-detection-depth))
-        (condition-case err
-            (when (project-project-p current-dir)
-              (let ((root (f-canonical current-dir)))
-                (message "[scribe-entry] DEBUG: Fallback upward project root found for %S: %S."
-                         canonical-file root)
-                (cl-return-from scribe-entry--find-project-root root)))
-          (error
-           ;; Log the error but continue moving up
-           (message "[scribe-entry] ERROR: Fallback project detection failed for directory %S: %S"
-                    current-dir err)))
-        (setq current-dir (f-dirname current-dir)) ; Move up one directory
-        (cl-incf depth))))
+    ;; 2. If `project-current` didn't find a project, perform upward search for project markers
+    (when (and (numberp scribe-entry-fallback-project-detection-depth)
+               (> scribe-entry-fallback-project-detection-depth 0)
+               (fboundp 'project-project-p))
+      (message "[scribe-entry] DEBUG: project-current did not find a project. Attempting fallback upward detection for %S (depth: %d)."
+               canonical-file scribe-entry-fallback-project-detection-depth)
+      (let ((current-dir (f-dirname canonical-file))
+            (depth 0))
+        ;; Loop upwards until root is found or max depth is reached
+        (while (and current-dir (<= depth scribe-entry-fallback-project-detection-depth))
+          (condition-case err
+              (when (project-project-p current-dir)
+                (let ((root (f-canonical current-dir)))
+                  (message "[scribe-entry] DEBUG: Fallback upward project root found for %S: %S."
+                           canonical-file root)
+                  (cl-return-from scribe-entry--find-project-root root)))
+            (error
+             ;; Log the error but continue moving up
+             (message "[scribe-entry] ERROR: Fallback project detection failed for directory %S: %S"
+                      current-dir err)))
+          (setq current-dir (f-dirname current-dir)) ; Move up one directory
+          (cl-incf depth))))
 
-  ;; 3. Final fallback if no project root found by any method
-  (message "[scribe-entry] DEBUG: No project root found for %S after all attempts."
-           canonical-file)
-  nil)
+    ;; 3. Final fallback if no project root found by any method
+    (message "[scribe-entry] DEBUG: No project root found for %S after all attempts."
+             canonical-file)
+    nil))
 
 (defun scribe-entry--resolve-namespace (path)
   "Determine the log namespace for PATH.
@@ -215,36 +224,6 @@
                         resolved-path err)
                nil)))))))
 
-(defun scribe-entry--project-namespace (&optional file)
-  "Derive a namespace symbol from FILE's project or directory.
-  This function is the default for `scribe-entry-namespace-function`.
-
-  - First, it resolves `file` to its canonical source path.
-  - If a project root is found for the resolved file (via `scribe-entry--find-project-root`),
-  it returns the project's root directory name as the namespace.
-  - Otherwise, it falls back to deriving the namespace from the directory name
-  of the resolved file.
-  - As a last resort, if `file` is nil or invalid, it uses `default-directory`.
-
-  FILE: The file path to derive the namespace from. Defaults to `default-directory` if nil.
-
-  Returns: A symbol representing the directory name, or `nil` if no meaningful
-  name can be derived or on error."
-  (unless (stringp file)
-    (setq file default-directory))
-
-  (let* ((resolved-file (scribe-entry--resolve-source-path file))
-         (canonical-file (f-canonical resolved-file))
-         ;; Find the most specific project root
-         (project-root (scribe-entry--find-project-root canonical-file))
-         ;; Use project root's directory name, or fallback to file's directory name
-         (dir-to-name (or project-root (f-dirname canonical-file)))
-         (name (when dir-to-name (file-name-nondirectory dir-to-name))))
-    (if (and name (not (s-blank? name)))
-        (intern name)
-      (message "[scribe-entry] WARNING: Could not derive project namespace for %S." file)
-      nil)))
-
 (defun scribe-entry--project-relative-file (file)
   "Return FILE path relative to its resolved source root or project root, sans extension.
   First resolves the `file` to its source path using `scribe-source-root-mapping`.
@@ -257,23 +236,25 @@
 
   Returns: The project-relative or basename of the file without its extension,
   or `nil` if the file is invalid or cannot be processed."
-  (unless (stringp file)
-    (message "[scribe-entry] WARNING: Invalid file path for relative path derivation: %S" file)
-    (cl-return-from scribe-entry--project-relative-file nil))
+  (cl-block scribe-entry--project-relative-file
+    (unless (stringp file)
+      (message "[scribe-entry] WARNING: Invalid file path for relative path derivation: %S" file)
+      (cl-return-from scribe-entry--project-relative-file nil))
 
-  (let* ((resolved-file (scribe-entry--resolve-source-path file))
-         (canonical-file (f-canonical resolved-file))
-         ;; Find the most specific project root
-         (project-root (scribe-entry--find-project-root canonical-file))
-         (relative-path canonical-file))
+    (let* ((resolved-file (scribe-entry--resolve-source-path file))
+           (canonical-file (f-canonical resolved-file))
+           ;; Find the most specific project root
+           (project-root (scribe-entry--find-project-root canonical-file))
+           (relative-path canonical-file))
 
-    (when (and project-root (string-prefix-p project-root canonical-file))
-      ;; If within a project, make path relative to project root
-      (setq relative-path (substring canonical-file (length project-root))))
+      (when (and project-root (string-prefix-p project-root canonical-file))
+        ;; If within a project, make path relative to project root
+        (setq relative-path (substring canonical-file (length project-root))))
 
-    ;; Remove file extension and strip any leading slashes
-    (let ((no-ext (file-name-sans-extension relative-path)))
-      (replace-regexp-in-string "^/+" "" no-ext))))
+      ;; Remove file extension and strip any leading slashes
+      (let ((no-ext (file-name-sans-extension relative-path)))
+        (replace-regexp-in-string "^/+" "" no-ext))))
+  )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Public API ;;
