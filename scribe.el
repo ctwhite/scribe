@@ -37,8 +37,8 @@
 ;;
 ;;; Code:
 
-(require 'scribe-context)
-(require 'scribe-log)
+(require 'scribe-context nil t)
+(require 'scribe-log nil t)
 
 (provide 'scribe)
 ;;; scribe.el ends here
